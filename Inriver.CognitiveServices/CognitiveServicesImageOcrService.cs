@@ -3,19 +3,24 @@ using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using inRiver.Remoting.Extension;
 using Newtonsoft.Json;
 
 namespace Inriver.CognitiveServices
 {
-    //http://docs.microsofttranslator.com/text-translate.html#!/default/get_Translate
-    //https://docs.microsoft.com/en-us/azure/cognitive-services/translator/quickstarts/csharp
+    enum ResponseCode
+    {
+        Succeeded,
+        Running,
+        Failed
+    }
 
     public class CognitiveServicesImageOcrService : IOcrService
     {
         private readonly string _apiKey;
-        private readonly string _uriBase = "https://northeurope.api.cognitive.microsoft.com/vision/v1.0/ocr";
+        private readonly string _uriBase = "https://northeurope.api.cognitive.microsoft.com/vision/v2.0/recognizeText";
 
         public CognitiveServicesImageOcrService(inRiverContext context)
         {
@@ -26,68 +31,111 @@ namespace Inriver.CognitiveServices
         {
             var ocrTask = MakeOcrRequest(image);
             ocrTask.Wait();
-            return ocrTask.Result;
+
+            var operationUrl = ocrTask.Result.Headers.GetValues("Operation-Location").FirstOrDefault();
+            Thread.Sleep(500);
+
+            for (var i = 0; i < 25; i++)
+            {
+                var operation = RequestResponse(operationUrl);
+                operation.Wait();
+
+                var responseCode = JsonResponseToSimpleText(operation.Result.Content.ReadAsStringAsync().Result, out var imageText);
+                if (responseCode == ResponseCode.Succeeded)
+                    return imageText;
+                if (responseCode == ResponseCode.Failed) return null;
+
+                Thread.Sleep(200);
+            }
+
+            return null;
         }
 
-        async Task<string> MakeOcrRequest(byte[] image)
+        private static ResponseCode JsonResponseToSimpleText(string result, out string imageText)
+        {
+            var jsonResponse = JsonConvert.DeserializeObject<Rootobject>(result);
+            if (jsonResponse.status == "Running")
+            {
+                imageText = null;
+                return ResponseCode.Running;
+            }
+
+            if (jsonResponse.status != "Succeeded")
+            {
+                imageText = null;
+                return ResponseCode.Failed;
+            }
+
+            var sb = new StringBuilder();
+            foreach (var regionLine in jsonResponse.recognitionResult.lines)
+            {
+                sb.Append($"{string.Join(" ", regionLine.words.Select(w => w.text))}\r\n");
+            }
+
+            imageText = sb.ToString();
+            return ResponseCode.Succeeded;
+        }
+
+        async Task<HttpResponseMessage> RequestResponse(string operationLocation)
         {
             try
             {
                 var client = new HttpClient();
                 client.DefaultRequestHeaders.Add("Ocp-Apim-Subscription-Key", _apiKey);
-                var requestParameters = "language=unk&detectOrientation=true";
+                return await client.GetAsync(operationLocation);
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+
+        async Task<HttpResponseMessage> MakeOcrRequest(byte[] image)
+        {
+            try
+            {
+                var client = new HttpClient();
+                client.DefaultRequestHeaders.Add("Ocp-Apim-Subscription-Key", _apiKey);
+                var requestParameters = "mode=Printed";
                 var uri = _uriBase + "?" + requestParameters;
                 HttpResponseMessage response;
 
                 using (var content = new ByteArrayContent(image))
                 {
                     content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-                    response = await client.PostAsync(uri, content);
+                    return await client.PostAsync(uri, content);
                 }
 
-                var contentString = await response.Content.ReadAsStringAsync();
-                var jsonResponse = JsonConvert.DeserializeObject<Rootobject>(contentString);
-
-                var sb = new StringBuilder();
-                foreach (var region in jsonResponse.regions)
-                {
-                    foreach (var regionLine in region.lines)
-                    {
-                        sb.Append($"{string.Join(" ", regionLine.words.Select(w => w.text))}\r\n");
-                    }
-                }
-
-                return sb.ToString();
             }
             catch (Exception)
             {
-                return "";
+                return null;
             }
         }
 
-        private class Rootobject
+
+        public class Rootobject
         {
-            public string language { get; set; }
-            public string orientation { get; set; }
-            public float textAngle { get; set; }
-            public Region[] regions { get; set; }
+            public string status { get; set; }
+            public Recognitionresult recognitionResult { get; set; }
         }
 
-        private class Region
+        public class Recognitionresult
         {
-            public string boundingBox { get; set; }
             public Line[] lines { get; set; }
         }
 
-        private class Line
+        public class Line
         {
-            public string boundingBox { get; set; }
+            public int[] boundingBox { get; set; }
+            public string text { get; set; }
             public Word[] words { get; set; }
         }
 
-        private class Word
+        public class Word
         {
-            public string boundingBox { get; set; }
+            public int[] boundingBox { get; set; }
             public string text { get; set; }
         }
     }
